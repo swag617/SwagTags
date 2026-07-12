@@ -1,0 +1,14 @@
+name: SwagTags
+version: 1.0
+main: com.swag.swagtags.TagPlugin
+api-version: 1.20
+softdepend: [PlaceholderAPI, SwagJobs]
+commands:
+  tag:
+    description: Main tag command
+    usage: /<command> [subcommand]
+    aliases: [stag]
+permissions:
+  swagtags.admin:
+    description: Allows access to admin commands
+    default: op

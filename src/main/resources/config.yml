@@ -1,0 +1,42 @@
+# SwagTags Configuration
+config-version: 3
+tags:
+  default: ""
+  format: "{PREFIX}{PLAYER}{SUFFIX}"
+  permission-error: "&cYou don't have permission to use this tag."
+
+# --- Credit & Purchase System ---
+credits:
+  enabled: true
+  price_per_tag: 10
+  starting_credits: 0
+  insufficient_credits_msg: "&cYou need {PRICE} credits to buy a custom tag. You have {BALANCE}."
+  purchase_success_msg: "&aYou bought a custom tag for {PRICE} credits! You now have {BALANCE} credits."
+  refund_percentage: 50  # Percentage refunded when deleting a tag
+  pending_expiry_days: 7  # Auto-cancel + refund a pending approval request after this many days with no admin response
+
+# --- Tag Validation ---
+validation:
+  enabled: true
+  min_length: 2
+  allow_colors: true
+  allow_special_chars: true
+  blocked_chars: []  # Add specific characters to block, e.g., ["#", "$", "@"]
+  blacklist:
+    - "badword"
+    - "inappropriate"
+  # Messages
+  too_long_msg: "&cTag is too long! Maximum {MAX} characters."
+  too_short_msg: "&cTag is too short! Minimum {MIN} characters."
+  blocked_char_msg: "&cTag contains blocked characters!"
+  blacklist_msg: "&cThat tag contains inappropriate content."
+  already_owned_msg: "&cYou already own this exact tag!"
+
+# --- Preset Tags (Future Implementation) ---
+preset_tags:
+  enabled: false
+  unlock_message: "&aYou unlocked a new tag: {TAG}"
+
+# --- Tag Withdrawal (convert a custom tag into a tradeable item for the AH) ---
+withdraw:
+  enabled: true
