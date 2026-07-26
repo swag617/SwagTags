@@ -1,6 +1,7 @@
 package com.swag.swagtags;
 
 import com.swag.swagtags.commands.TagCommand;
+import com.swag.swagtags.database.DatabaseManager;
 import com.swag.swagtags.gui.JobTagGUI;
 import com.swag.swagtags.gui.TagApprovalGUI;
 import com.swag.swagtags.gui.TagBuyConfirmGUI;
@@ -13,17 +14,13 @@ import com.swag.swagtags.models.Tag;
 import com.swag.swagtags.util.ColorUtil;
 import org.bukkit.Bukkit;
 import org.bukkit.ChatColor;
-import org.bukkit.configuration.ConfigurationSection;
-import org.bukkit.configuration.file.FileConfiguration;
-import org.bukkit.configuration.file.YamlConfiguration;
 import org.bukkit.entity.Player;
 import org.bukkit.event.EventHandler;
 import org.bukkit.event.Listener;
+import org.bukkit.event.player.PlayerJoinEvent;
 import org.bukkit.event.player.PlayerQuitEvent;
 import org.bukkit.plugin.java.JavaPlugin;
 
-import java.io.File;
-import java.io.IOException;
 import java.util.*;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.stream.Collectors;
@@ -43,11 +40,9 @@ public final class TagPlugin extends JavaPlugin implements Listener {
     private final Map<String, LoanedTag> activeLoans = new ConcurrentHashMap<>();
     private final Map<UUID, String> playerEquippedLoanedTag = new ConcurrentHashMap<>();
 
-    private File playerDataFolder;
-    private File tagsFile;
-    private File equippedTagsFile;
-    private File loansFile;
-    private File pendingTagsFile;
+    // ── SwagAPI service references ─────────────────────────────────────────────
+    private com.SwagDev.SwagAPI.api.IDatabaseService dbService;
+    private DatabaseManager databaseManager;
 
     private TagApprovalGUI tagApprovalGUI;
     private TagListGUI tagListGUI;
@@ -70,6 +65,17 @@ public final class TagPlugin extends JavaPlugin implements Listener {
         saveDefaultConfig();
         migrateConfig();
 
+        // ── Step 1: Hook SwagAPI (must be first) — SwagTags now has a hard dependency on
+        // SwagAPI's shared database service for all persistence (tags, loans, pending
+        // approvals, credits). If it isn't present, disable rather than fall back to YAML.
+        if (!hookSwagAPI()) {
+            getServer().getPluginManager().disablePlugin(this);
+            return;
+        }
+
+        this.databaseManager = new DatabaseManager(this, dbService);
+        this.databaseManager.connect();
+
         this.tagApprovalGUI = new TagApprovalGUI(this);
         this.tagListGUI = new TagListGUI(this);
         this.tagBuyConfirmGUI = new TagBuyConfirmGUI(this);
@@ -87,29 +93,6 @@ public final class TagPlugin extends JavaPlugin implements Listener {
         getServer().getPluginManager().registerEvents(this.tagBuyConfirmGUI, this);
         getServer().getPluginManager().registerEvents(this.jobTagGUI, this);
         getServer().getPluginManager().registerEvents(this.tagWithdrawGUI, this);
-
-        playerDataFolder = new File(getDataFolder(), "playerdata");
-        if (!playerDataFolder.exists()) playerDataFolder.mkdirs();
-
-        tagsFile = new File(getDataFolder(), "tags.yml");
-        if (!tagsFile.exists()) {
-            try { tagsFile.createNewFile(); } catch (IOException e) { e.printStackTrace(); }
-        }
-
-        equippedTagsFile = new File(getDataFolder(), "equipped.yml");
-        if (!equippedTagsFile.exists()) {
-            try { equippedTagsFile.createNewFile(); } catch (IOException e) { e.printStackTrace(); }
-        }
-
-        loansFile = new File(getDataFolder(), "loans.yml");
-        if (!loansFile.exists()) {
-            try { loansFile.createNewFile(); } catch (IOException e) { e.printStackTrace(); }
-        }
-
-        pendingTagsFile = new File(getDataFolder(), "pending.yml");
-        if (!pendingTagsFile.exists()) {
-            try { pendingTagsFile.createNewFile(); } catch (IOException e) { e.printStackTrace(); }
-        }
 
         loadAllTags();
         loadAllEquippedTags();
@@ -129,11 +112,34 @@ public final class TagPlugin extends JavaPlugin implements Listener {
 
     @Override
     public void onDisable() {
-        saveAllTags();
-        saveAllEquippedTags();
-        saveAllPlayerCredits();
-        saveAllLoans();
-        saveAllPendingTags();
+        // MIGRATED: persistence is now granular — every mutation (equip, delete, loan,
+        // pending approval, credit change) already upserts/deletes its own row via
+        // DatabaseManager at the time it happens, so no bulk "save everything" pass is
+        // needed on shutdown. Those writes are dispatched async (dbService.executeAsync),
+        // but SwagAPI's IDatabaseService falls back to running them synchronously if SwagAPI
+        // itself is already disabled by the time a write fires, so nothing is silently
+        // dropped during a normal shutdown. The SwagAPI-owned connection pool is closed by
+        // SwagAPI itself, not here.
+        getLogger().info("SwagTags disabled.");
+    }
+
+    /**
+     * Hooks SwagAPI's shared IDatabaseService. This is now a hard requirement for SwagTags
+     * (see the SwagJobsPlugin#hookSwagAPI pattern this mirrors) — if SwagAPI isn't loaded,
+     * SwagTags disables itself rather than silently falling back to YAML flatfiles.
+     */
+    private boolean hookSwagAPI() {
+        org.bukkit.plugin.ServicesManager sm = getServer().getServicesManager();
+
+        org.bukkit.plugin.RegisteredServiceProvider<com.SwagDev.SwagAPI.api.IDatabaseService> dbProv =
+                sm.getRegistration(com.SwagDev.SwagAPI.api.IDatabaseService.class);
+        if (dbProv == null) {
+            getLogger().severe("SwagAPI IDatabaseService not found! Is SwagAPI loaded? Disabling.");
+            return false;
+        }
+        dbService = dbProv.getProvider();
+        getLogger().info("Hooked SwagAPI IDatabaseService.");
+        return true;
     }
 
     // ========== Config Migration ==========
@@ -246,7 +252,7 @@ public final class TagPlugin extends JavaPlugin implements Listener {
         }
         allTags.put(tag.getId(), tag);
         playerOwnedTags.computeIfAbsent(uuid, k -> new ArrayList<>()).add(tag.getId());
-        saveAllTags();
+        databaseManager.upsertTag(tag);
         return tag;
     }
 
@@ -261,13 +267,13 @@ public final class TagPlugin extends JavaPlugin implements Listener {
         if (isTagLoaned(tagId)) return false;
 
         playerEquippedTag.put(uuid, tagId);
-        saveAllEquippedTags();
+        databaseManager.setEquippedTag(uuid, tagId);
         return true;
     }
 
     public void unequipTag(UUID uuid) {
         playerEquippedTag.remove(uuid);
-        saveAllEquippedTags();
+        databaseManager.removeEquippedTag(uuid);
     }
 
     public boolean deleteTag(UUID uuid, String tagId, boolean refundCredits) {
@@ -281,7 +287,8 @@ public final class TagPlugin extends JavaPlugin implements Listener {
         List<String> owned = playerOwnedTags.get(uuid);
         if (owned != null) owned.remove(tagId);
 
-        if (tagId.equals(playerEquippedTag.get(uuid))) {
+        boolean wasEquipped = tagId.equals(playerEquippedTag.get(uuid));
+        if (wasEquipped) {
             playerEquippedTag.remove(uuid);
         }
 
@@ -291,8 +298,10 @@ public final class TagPlugin extends JavaPlugin implements Listener {
             addPlayerCredits(uuid, refundAmount);
         }
 
-        saveAllTags();
-        saveAllEquippedTags();
+        databaseManager.deleteTag(tagId);
+        if (wasEquipped) {
+            databaseManager.removeEquippedTag(uuid);
+        }
         return true;
     }
 
@@ -315,10 +324,10 @@ public final class TagPlugin extends JavaPlugin implements Listener {
 
         if (tagId.equals(playerEquippedTag.get(uuid))) {
             playerEquippedTag.remove(uuid);
-            saveAllEquippedTags();
+            databaseManager.removeEquippedTag(uuid);
         }
 
-        saveAllTags();
+        databaseManager.deleteTag(tagId);
         return tag;
     }
 
@@ -348,10 +357,10 @@ public final class TagPlugin extends JavaPlugin implements Listener {
 
         if (tagId.equals(playerEquippedTag.get(ownerUUID))) {
             playerEquippedTag.remove(ownerUUID);
-            saveAllEquippedTags();
+            databaseManager.removeEquippedTag(ownerUUID);
         }
 
-        saveAllLoans();
+        databaseManager.upsertLoan(loan);
         return true;
     }
 
@@ -364,7 +373,7 @@ public final class TagPlugin extends JavaPlugin implements Listener {
             playerEquippedLoanedTag.remove(recipientUUID);
         }
 
-        saveAllLoans();
+        databaseManager.deleteLoan(tagId);
 
         if (notify) {
             Tag tag = allTags.get(tagId);
@@ -524,14 +533,17 @@ public final class TagPlugin extends JavaPlugin implements Listener {
 
     /** Submit a suffix for admin approval, escrowing the credits already charged for it. */
     public void submitPendingTag(UUID uuid, String suffix, int creditsEscrowed) {
-        pendingCustomTags.put(uuid, new PendingTag(suffix, creditsEscrowed));
-        saveAllPendingTags();
+        PendingTag pending = new PendingTag(suffix, creditsEscrowed);
+        pendingCustomTags.put(uuid, pending);
+        databaseManager.upsertPendingTag(uuid, pending);
     }
 
     /** Removes and returns the pending request for a player (approve/deny/expire all funnel through here). */
     public PendingTag removePendingTag(UUID uuid) {
         PendingTag removed = pendingCustomTags.remove(uuid);
-        saveAllPendingTags();
+        if (removed != null) {
+            databaseManager.deletePendingTag(uuid);
+        }
         return removed;
     }
 
@@ -572,12 +584,18 @@ public final class TagPlugin extends JavaPlugin implements Listener {
     public boolean isWithdrawEnabled() { return getConfig().getBoolean("withdraw.enabled", true); }
 
     public int getPlayerCredits(UUID uuid) {
-        return playerCredits.getOrDefault(uuid, loadPlayerCredits(uuid));
+        Integer cached = playerCredits.get(uuid);
+        if (cached != null) return cached;
+
+        Integer loaded = databaseManager.loadPlayerCredits(uuid);
+        int credits = loaded != null ? loaded : getConfig().getInt("credits.starting_credits", 0);
+        playerCredits.put(uuid, credits);
+        return credits;
     }
 
     public void setPlayerCredits(UUID uuid, int credits) {
         playerCredits.put(uuid, credits);
-        savePlayerCredits(uuid, credits);
+        databaseManager.setPlayerCredits(uuid, credits);
     }
 
     public void addPlayerCredits(UUID uuid, int amount) {
@@ -601,185 +619,68 @@ public final class TagPlugin extends JavaPlugin implements Listener {
         playerEquippedLoanedTag.remove(uuid);
     }
 
+    /**
+     * Warms the credits cache for players who weren't picked up by the bulk startup load
+     * (i.e. players who have never had a swagtags_credits row before). Without this, the
+     * very first {@link #getPlayerCredits(UUID)} call for a brand-new player would fall
+     * through to a synchronous DB read on whatever thread triggered it (typically the main
+     * thread, e.g. opening the buy-tag GUI). Doing the lookup here instead, off the main
+     * thread via {@code queryAsync}, means that path is only ever hit as a narrow fallback.
+     */
+    @EventHandler
+    public void onPlayerJoinWarmCredits(PlayerJoinEvent event) {
+        UUID uuid = event.getPlayer().getUniqueId();
+        if (playerCredits.containsKey(uuid)) return; // already present from the startup bulk load
+
+        dbService.queryAsync(() -> databaseManager.loadPlayerCredits(uuid))
+                .thenAccept(loaded -> Bukkit.getScheduler().runTask(this, () -> {
+                    int credits = loaded != null ? loaded : getConfig().getInt("credits.starting_credits", 0);
+                    playerCredits.putIfAbsent(uuid, credits);
+                }));
+    }
+
     // ========== Persistence ==========
+    // MIGRATED: all persistence now flows through DatabaseManager (SwagAPI shared database)
+    // instead of ad-hoc YAML flatfiles. These methods only populate the in-memory maps at
+    // startup — every mutation elsewhere in this class writes straight through to the
+    // database at the time it happens (see equipTag/deleteTag/loanTag/etc. above).
 
     private void loadAllTags() {
-        FileConfiguration config = YamlConfiguration.loadConfiguration(tagsFile);
-
-        for (String tagId : config.getKeys(false)) {
-            ConfigurationSection section = config.getConfigurationSection(tagId);
-            if (section == null) continue;
-
-            try {
-                UUID ownerUUID = UUID.fromString(section.getString("owner"));
-                String suffix = section.getString("suffix");
-                Tag.TagType type = Tag.TagType.valueOf(section.getString("type", "CUSTOM"));
-                long created = section.getLong("created", System.currentTimeMillis());
-
-                Tag tag = new Tag(tagId, ownerUUID, suffix, type, created);
-                allTags.put(tagId, tag);
-                playerOwnedTags.computeIfAbsent(ownerUUID, k -> new ArrayList<>()).add(tagId);
-
-            } catch (Exception e) {
-                getLogger().warning("Failed to load tag " + tagId + ": " + e.getMessage());
-            }
+        allTags.putAll(databaseManager.loadAllTags());
+        for (Tag tag : allTags.values()) {
+            playerOwnedTags.computeIfAbsent(tag.getOwnerUUID(), k -> new ArrayList<>()).add(tag.getId());
         }
-
         getLogger().info("Loaded " + allTags.size() + " tags");
     }
 
-    private void saveAllTags() {
-        FileConfiguration config = new YamlConfiguration();
-
-        for (Map.Entry<String, Tag> entry : allTags.entrySet()) {
-            String tagId = entry.getKey();
-            Tag tag = entry.getValue();
-            config.set(tagId + ".owner", tag.getOwnerUUID().toString());
-            config.set(tagId + ".suffix", tag.getSuffix());
-            config.set(tagId + ".type", tag.getType().name());
-            config.set(tagId + ".created", tag.getCreatedTimestamp());
-        }
-
-        try {
-            config.save(tagsFile);
-        } catch (IOException e) {
-            e.printStackTrace();
-        }
-    }
-
     private void loadAllEquippedTags() {
-        FileConfiguration config = YamlConfiguration.loadConfiguration(equippedTagsFile);
-
-        for (String key : config.getKeys(false)) {
-            try {
-                UUID uuid = UUID.fromString(key);
-                String tagId = config.getString(key);
-                playerEquippedTag.put(uuid, tagId);
-            } catch (Exception ignored) {}
-        }
-
+        playerEquippedTag.putAll(databaseManager.loadAllEquippedTags());
         getLogger().info("Loaded " + playerEquippedTag.size() + " equipped tags");
     }
 
-    private void saveAllEquippedTags() {
-        FileConfiguration config = new YamlConfiguration();
-        playerEquippedTag.forEach((uuid, tagId) -> config.set(uuid.toString(), tagId));
-
-        try {
-            config.save(equippedTagsFile);
-        } catch (IOException e) {
-            e.printStackTrace();
-        }
-    }
-
     private void loadAllLoans() {
-        FileConfiguration config = YamlConfiguration.loadConfiguration(loansFile);
-
-        int loaded = 0;
-        for (String tagId : config.getKeys(false)) {
-            try {
-                ConfigurationSection section = config.getConfigurationSection(tagId);
-                UUID ownerUUID = UUID.fromString(section.getString("owner"));
-                UUID loanedToUUID = UUID.fromString(section.getString("loanedTo"));
-                long expiryTime = section.getLong("expiry");
-
-                LoanedTag loan = new LoanedTag(tagId, ownerUUID, loanedToUUID, expiryTime);
-                if (!loan.isExpired()) {
-                    activeLoans.put(tagId, loan);
-                    loaded++;
-                }
-            } catch (Exception e) {
-                getLogger().warning("Failed to load loan for tag " + tagId + ": " + e.getMessage());
+        Map<String, LoanedTag> loaded = databaseManager.loadAllLoans();
+        int activeCount = 0;
+        for (Map.Entry<String, LoanedTag> entry : loaded.entrySet()) {
+            LoanedTag loan = entry.getValue();
+            // Preserve original behaviour: only non-expired loans are loaded into memory.
+            // Expired rows are left in the database and cleaned up the next time
+            // checkLoanExpiry()/returnLoan() processes that tag id.
+            if (!loan.isExpired()) {
+                activeLoans.put(entry.getKey(), loan);
+                activeCount++;
             }
         }
-
-        getLogger().info("Loaded " + loaded + " active tag loans");
-    }
-
-    private void saveAllLoans() {
-        FileConfiguration config = new YamlConfiguration();
-
-        for (Map.Entry<String, LoanedTag> entry : activeLoans.entrySet()) {
-            String tagId = entry.getKey();
-            LoanedTag loan = entry.getValue();
-            config.set(tagId + ".owner", loan.getOwnerUUID().toString());
-            config.set(tagId + ".loanedTo", loan.getLoanedToUUID().toString());
-            config.set(tagId + ".expiry", loan.getExpiryTime());
-        }
-
-        try {
-            config.save(loansFile);
-        } catch (IOException e) {
-            e.printStackTrace();
-        }
+        getLogger().info("Loaded " + activeCount + " active tag loans");
     }
 
     private void loadAllPendingTags() {
-        FileConfiguration config = YamlConfiguration.loadConfiguration(pendingTagsFile);
-
-        for (String key : config.getKeys(false)) {
-            try {
-                ConfigurationSection section = config.getConfigurationSection(key);
-                UUID uuid = UUID.fromString(key);
-                String suffix = section.getString("suffix");
-                int creditsEscrowed = section.getInt("creditsEscrowed", 0);
-                long timestamp = section.getLong("timestamp", System.currentTimeMillis());
-
-                pendingCustomTags.put(uuid, new PendingTag(suffix, creditsEscrowed, timestamp));
-            } catch (Exception e) {
-                getLogger().warning("Failed to load pending tag " + key + ": " + e.getMessage());
-            }
-        }
-
+        pendingCustomTags.putAll(databaseManager.loadAllPendingTags());
         getLogger().info("Loaded " + pendingCustomTags.size() + " pending tag requests");
     }
 
-    private void saveAllPendingTags() {
-        FileConfiguration config = new YamlConfiguration();
-
-        for (Map.Entry<UUID, PendingTag> entry : pendingCustomTags.entrySet()) {
-            String uuid = entry.getKey().toString();
-            PendingTag pending = entry.getValue();
-            config.set(uuid + ".suffix", pending.getSuffix());
-            config.set(uuid + ".creditsEscrowed", pending.getCreditsEscrowed());
-            config.set(uuid + ".timestamp", pending.getTimestamp());
-        }
-
-        try {
-            config.save(pendingTagsFile);
-        } catch (IOException e) {
-            e.printStackTrace();
-        }
-    }
-
-    private int loadPlayerCredits(UUID uuid) {
-        File file = new File(playerDataFolder, uuid.toString() + ".yml");
-        if (!file.exists()) return getConfig().getInt("credits.starting_credits", 0);
-        return YamlConfiguration.loadConfiguration(file).getInt("credits", 0);
-    }
-
-    private void savePlayerCredits(UUID uuid, int credits) {
-        File file = new File(playerDataFolder, uuid.toString() + ".yml");
-        FileConfiguration config = new YamlConfiguration();
-        config.set("credits", credits);
-        try { config.save(file); } catch (IOException e) { e.printStackTrace(); }
-    }
-
     private void loadAllPlayerCredits() {
-        File[] files = playerDataFolder.listFiles();
-        if (files == null) return;
-        for (File file : files) {
-            if (file.getName().endsWith(".yml")) {
-                try {
-                    UUID uuid = UUID.fromString(file.getName().replace(".yml", ""));
-                    playerCredits.put(uuid, YamlConfiguration.loadConfiguration(file).getInt("credits", 0));
-                } catch (Exception ignored) {}
-            }
-        }
+        playerCredits.putAll(databaseManager.loadAllPlayerCredits());
         getLogger().info("Loaded credits for " + playerCredits.size() + " players");
-    }
-
-    private void saveAllPlayerCredits() {
-        playerCredits.forEach(this::savePlayerCredits);
     }
 }
