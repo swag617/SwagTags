@@ -13,7 +13,7 @@ Expected if SwagJobs isn't present — this form of the command only works with 
 
 ## A player's purchase never showed up in `/tag admin`
 
-Check `plugins/SwagTags/pending.yml` directly — if the entry isn't there, the purchase confirmation likely wasn't completed (they may have hit Cancel, or their client disconnected before submitting). Ask them to retry `/tag buy <suffix>`.
+Check the `swagtags_pending` table in SwagAPI's shared database directly — if the entry isn't there, the purchase confirmation likely wasn't completed (they may have hit Cancel, or their client disconnected before submitting). Ask them to retry `/tag buy <suffix>`.
 
 ## Config changes aren't taking effect
 

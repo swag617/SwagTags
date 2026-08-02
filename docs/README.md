@@ -42,6 +42,7 @@ Beyond the core buy → approve → equip loop, SwagTags includes a full economy
 |---|---|
 | Paper 1.20+ (built against Paper API 1.21) | Yes |
 | Java 17 | Yes |
+| SwagAPI | **Yes** — provides the shared database service that backs all tag/loan/credit storage |
 | PlaceholderAPI | No — needed only for `%swagtags_tag%` display placeholders |
 | SwagJobs | No — needed only for the job-preset tag grant GUI |
 

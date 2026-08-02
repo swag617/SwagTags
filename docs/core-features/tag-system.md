@@ -34,4 +34,8 @@ You can't own two tags with the exact same suffix string (case-insensitive) — 
 
 ## Persistence
 
-Tag ownership lives in `tags.yml`, equip state in `equipped.yml`, credits per-player in `playerdata/<uuid>.yml`, active loans in `loans.yml`, and pending approvals in `pending.yml`. All of these are plain YAML, loaded on `onEnable` and saved on `onDisable` plus after every mutating action (equip, delete, buy, etc.) — not just periodically.
+Tag ownership, equip state, credits, active loans, and pending approvals are all persisted through **SwagAPI's shared database service** (`IDatabaseService`), not local YAML files. SwagTags is a hard dependency on SwagAPI — if SwagAPI isn't loaded, SwagTags disables itself at startup rather than falling back to flatfiles.
+
+Each of these lives in its own table (`swagtags_tags`, `swagtags_equipped`, `swagtags_loans`, `swagtags_pending`, `swagtags_credits`), all loaded into memory once on `onEnable`. Every mutating action (equip, delete, buy, loan, credit change, etc.) writes straight through to the database at the time it happens via `DatabaseManager`, dispatched asynchronously through `dbService.executeAsync(...)` so gameplay never blocks on the JDBC round-trip. The underlying connection pool is owned and closed by SwagAPI, not SwagTags.
+
+If you're upgrading from a pre-SwagAPI version of SwagTags, any legacy `tags.yml`, `equipped.yml`, `loans.yml`, `pending.yml`, and `playerdata/*.yml` files found in the plugin's data folder are automatically imported into the shared database on first startup (insert-if-absent, safe to re-run), then renamed with an `.imported` suffix so they aren't re-imported.
