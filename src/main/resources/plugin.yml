@@ -1,5 +1,5 @@
 name: SwagTags
-version: 1.0
+version: 1.0.1
 main: com.swag.swagtags.TagPlugin
 api-version: 1.20
 depend: [SwagAPI]
