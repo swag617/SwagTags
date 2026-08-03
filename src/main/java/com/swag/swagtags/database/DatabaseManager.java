@@ -481,33 +481,69 @@ public class DatabaseManager {
     // ========================================================================================
 
     /**
-     * Detects the legacy flatfiles this plugin used before the SwagAPI migration
-     * (tags.yml, equipped.yml, loans.yml, pending.yml, playerdata/*.yml) and, if found,
-     * imports their contents into the shared database. Existing rows in the shared database
-     * are never overwritten (insert-if-absent), so this is safe to re-run.
+     * Detects the legacy flatfiles this plugin (and its predecessor, FleaTags) used before
+     * the SwagAPI migration (tags.yml, equipped.yml, loans.yml, pending.yml,
+     * playerdata/*.yml) and, if found, imports their contents into the shared database.
+     * Existing rows in the shared database are never overwritten (insert-if-absent), so
+     * this is safe to re-run.
      * <p>
-     * Successfully imported files are renamed with an ".imported" suffix (and the
-     * playerdata folder likewise) rather than deleted, so nothing is destroyed if a
-     * problem is discovered after the fact — see the class-level migration note in
-     * TagPlugin for the rollback path.
+     * Two independent locations are checked, so the FleaTags → SwagTags cutover requires
+     * zero manual file-wrangling by an admin:
+     * <ol>
+     *   <li><b>SwagTags's own data folder</b> (a manual drop-in, e.g. {@code plugins/SwagTags/tags.yml}).
+     *       Successfully imported files here are renamed with an ".imported" suffix (and the
+     *       playerdata folder likewise) rather than deleted, so nothing is destroyed if a
+     *       problem is discovered after the fact — see the class-level migration note in
+     *       TagPlugin for the rollback path. Mutating these files is safe: they already live
+     *       inside SwagTags's own folder.</li>
+     *   <li><b>The sibling {@code plugins/FleaTags/} folder</b>, checked automatically so an
+     *       operator can simply swap the plugin jar and restart — no copying required. This
+     *       path is strictly <b>read-only</b>: SwagTags does not own that directory (FleaTags
+     *       might still be sitting there uninstalled-but-present), so nothing under it is ever
+     *       renamed, deleted, or otherwise modified. "Already imported from here" is instead
+     *       tracked with small marker files inside SwagTags's own data folder (see
+     *       {@link #siblingImportMarker(String)}).</li>
+     * </ol>
      */
     private void importLegacyYamlIfPresent() {
         File dataFolder = plugin.getDataFolder();
         boolean mysql = dbService.isMySQL();
 
-        importLegacyTagsYaml(new File(dataFolder, "tags.yml"), mysql);
-        importLegacyEquippedYaml(new File(dataFolder, "equipped.yml"), mysql);
-        importLegacyLoansYaml(new File(dataFolder, "loans.yml"), mysql);
-        importLegacyPendingYaml(new File(dataFolder, "pending.yml"), mysql);
-        importLegacyPlayerDataFolder(new File(dataFolder, "playerdata"), mysql);
+        // Path 1: manual drop-in to SwagTags's own folder (fallback — kept for compatibility).
+        importLegacyTagsYaml(new File(dataFolder, "tags.yml"), mysql, file -> renameImported(file));
+        importLegacyEquippedYaml(new File(dataFolder, "equipped.yml"), mysql, file -> renameImported(file));
+        importLegacyLoansYaml(new File(dataFolder, "loans.yml"), mysql, file -> renameImported(file));
+        importLegacyPendingYaml(new File(dataFolder, "pending.yml"), mysql, file -> renameImported(file));
+        importLegacyPlayerDataFolder(new File(dataFolder, "playerdata"), mysql, folder -> renameImportedFolder(folder));
+
+        // Path 2: the old FleaTags plugin's own (untouched) data folder sitting next to this
+        // one. Read-only — see javadoc above.
+        File fleaTagsFolder = new File(dataFolder.getParentFile(), "FleaTags");
+        if (!fleaTagsFolder.isDirectory()) return;
+
+        if (!isSiblingAlreadyImported("tags.yml")) {
+            importLegacyTagsYaml(new File(fleaTagsFolder, "tags.yml"), mysql, file -> markSiblingImported("tags.yml"));
+        }
+        if (!isSiblingAlreadyImported("equipped.yml")) {
+            importLegacyEquippedYaml(new File(fleaTagsFolder, "equipped.yml"), mysql, file -> markSiblingImported("equipped.yml"));
+        }
+        if (!isSiblingAlreadyImported("loans.yml")) {
+            importLegacyLoansYaml(new File(fleaTagsFolder, "loans.yml"), mysql, file -> markSiblingImported("loans.yml"));
+        }
+        if (!isSiblingAlreadyImported("pending.yml")) {
+            importLegacyPendingYaml(new File(fleaTagsFolder, "pending.yml"), mysql, file -> markSiblingImported("pending.yml"));
+        }
+        if (!isSiblingAlreadyImported("playerdata")) {
+            importLegacyPlayerDataFolder(new File(fleaTagsFolder, "playerdata"), mysql, folder -> markSiblingImported("playerdata"));
+        }
     }
 
-    private void importLegacyTagsYaml(File file, boolean mysql) {
+    private void importLegacyTagsYaml(File file, boolean mysql, java.util.function.Consumer<File> onImported) {
         if (!file.isFile()) return;
         FileConfiguration config = YamlConfiguration.loadConfiguration(file);
         java.util.Set<String> keys = config.getKeys(false);
         if (keys.isEmpty()) {
-            renameImported(file);
+            onImported.accept(file);
             return;
         }
 
@@ -530,19 +566,19 @@ public class DatabaseManager {
                     plugin.getLogger().warning("Legacy import: failed to import tag '" + tagId + "': " + e.getMessage());
                 }
             }
-            plugin.getLogger().info("Legacy import: imported " + imported + " tag(s) from tags.yml.");
-            renameImported(file);
+            plugin.getLogger().info("Legacy import: imported " + imported + " tag(s) from " + file.getPath() + ".");
+            onImported.accept(file);
         } catch (SQLException e) {
-            plugin.getLogger().log(Level.SEVERE, "Legacy import of tags.yml failed. The file has been left in place so you can retry.", e);
+            plugin.getLogger().log(Level.SEVERE, "Legacy import of " + file.getPath() + " failed. The file has been left in place so you can retry.", e);
         }
     }
 
-    private void importLegacyEquippedYaml(File file, boolean mysql) {
+    private void importLegacyEquippedYaml(File file, boolean mysql, java.util.function.Consumer<File> onImported) {
         if (!file.isFile()) return;
         FileConfiguration config = YamlConfiguration.loadConfiguration(file);
         java.util.Set<String> keys = config.getKeys(false);
         if (keys.isEmpty()) {
-            renameImported(file);
+            onImported.accept(file);
             return;
         }
 
@@ -562,19 +598,19 @@ public class DatabaseManager {
                     plugin.getLogger().warning("Legacy import: failed to import equipped tag for '" + key + "': " + e.getMessage());
                 }
             }
-            plugin.getLogger().info("Legacy import: imported " + imported + " equipped-tag row(s) from equipped.yml.");
-            renameImported(file);
+            plugin.getLogger().info("Legacy import: imported " + imported + " equipped-tag row(s) from " + file.getPath() + ".");
+            onImported.accept(file);
         } catch (SQLException e) {
-            plugin.getLogger().log(Level.SEVERE, "Legacy import of equipped.yml failed. The file has been left in place so you can retry.", e);
+            plugin.getLogger().log(Level.SEVERE, "Legacy import of " + file.getPath() + " failed. The file has been left in place so you can retry.", e);
         }
     }
 
-    private void importLegacyLoansYaml(File file, boolean mysql) {
+    private void importLegacyLoansYaml(File file, boolean mysql, java.util.function.Consumer<File> onImported) {
         if (!file.isFile()) return;
         FileConfiguration config = YamlConfiguration.loadConfiguration(file);
         java.util.Set<String> keys = config.getKeys(false);
         if (keys.isEmpty()) {
-            renameImported(file);
+            onImported.accept(file);
             return;
         }
 
@@ -596,19 +632,19 @@ public class DatabaseManager {
                     plugin.getLogger().warning("Legacy import: failed to import loan for tag '" + tagId + "': " + e.getMessage());
                 }
             }
-            plugin.getLogger().info("Legacy import: imported " + imported + " loan(s) from loans.yml.");
-            renameImported(file);
+            plugin.getLogger().info("Legacy import: imported " + imported + " loan(s) from " + file.getPath() + ".");
+            onImported.accept(file);
         } catch (SQLException e) {
-            plugin.getLogger().log(Level.SEVERE, "Legacy import of loans.yml failed. The file has been left in place so you can retry.", e);
+            plugin.getLogger().log(Level.SEVERE, "Legacy import of " + file.getPath() + " failed. The file has been left in place so you can retry.", e);
         }
     }
 
-    private void importLegacyPendingYaml(File file, boolean mysql) {
+    private void importLegacyPendingYaml(File file, boolean mysql, java.util.function.Consumer<File> onImported) {
         if (!file.isFile()) return;
         FileConfiguration config = YamlConfiguration.loadConfiguration(file);
         java.util.Set<String> keys = config.getKeys(false);
         if (keys.isEmpty()) {
-            renameImported(file);
+            onImported.accept(file);
             return;
         }
 
@@ -631,18 +667,18 @@ public class DatabaseManager {
                     plugin.getLogger().warning("Legacy import: failed to import pending tag for '" + key + "': " + e.getMessage());
                 }
             }
-            plugin.getLogger().info("Legacy import: imported " + imported + " pending tag request(s) from pending.yml.");
-            renameImported(file);
+            plugin.getLogger().info("Legacy import: imported " + imported + " pending tag request(s) from " + file.getPath() + ".");
+            onImported.accept(file);
         } catch (SQLException e) {
-            plugin.getLogger().log(Level.SEVERE, "Legacy import of pending.yml failed. The file has been left in place so you can retry.", e);
+            plugin.getLogger().log(Level.SEVERE, "Legacy import of " + file.getPath() + " failed. The file has been left in place so you can retry.", e);
         }
     }
 
-    private void importLegacyPlayerDataFolder(File folder, boolean mysql) {
+    private void importLegacyPlayerDataFolder(File folder, boolean mysql, java.util.function.Consumer<File> onImported) {
         if (!folder.isDirectory()) return;
         File[] files = folder.listFiles((dir, name) -> name.endsWith(".yml"));
         if (files == null || files.length == 0) {
-            // Nothing to import — still fine to leave an empty folder in place, no rename needed.
+            // Nothing to import — still fine to leave an empty folder in place, no marker needed.
             return;
         }
 
@@ -662,17 +698,10 @@ public class DatabaseManager {
                     plugin.getLogger().warning("Legacy import: failed to import player credits from '" + file.getName() + "': " + e.getMessage());
                 }
             }
-            plugin.getLogger().info("Legacy import: imported " + imported + " player credit balance(s) from playerdata/.");
-
-            File renamed = new File(folder.getParentFile(), "playerdata.imported");
-            if (folder.renameTo(renamed)) {
-                plugin.getLogger().info("Renamed 'playerdata' to 'playerdata.imported' so it won't be imported again.");
-            } else {
-                plugin.getLogger().warning("Legacy import of playerdata/ succeeded but the folder could not be renamed. " +
-                        "Please rename or remove it manually to prevent re-importing on next restart.");
-            }
+            plugin.getLogger().info("Legacy import: imported " + imported + " player credit balance(s) from " + folder.getPath() + ".");
+            onImported.accept(folder);
         } catch (SQLException e) {
-            plugin.getLogger().log(Level.SEVERE, "Legacy import of playerdata/ failed. The folder has been left in place so you can retry.", e);
+            plugin.getLogger().log(Level.SEVERE, "Legacy import of " + folder.getPath() + " failed. The folder has been left in place so you can retry.", e);
         }
     }
 
@@ -682,6 +711,50 @@ public class DatabaseManager {
         if (!file.renameTo(renamed)) {
             plugin.getLogger().warning("Legacy import of '" + file.getName() + "' succeeded but the file could not be renamed. " +
                     "Please rename or remove it manually to prevent re-importing on next restart.");
+        }
+    }
+
+    /** Renames a successfully-imported legacy "playerdata" folder to "playerdata.imported". */
+    private void renameImportedFolder(File folder) {
+        File renamed = new File(folder.getParentFile(), "playerdata.imported");
+        if (folder.renameTo(renamed)) {
+            plugin.getLogger().info("Renamed 'playerdata' to 'playerdata.imported' so it won't be imported again.");
+        } else {
+            plugin.getLogger().warning("Legacy import of playerdata/ succeeded but the folder could not be renamed. " +
+                    "Please rename or remove it manually to prevent re-importing on next restart.");
+        }
+    }
+
+    /**
+     * The marker file (inside SwagTags's OWN data folder, never inside the sibling
+     * FleaTags folder) that records whether a given legacy source from the sibling FleaTags
+     * installation has already been imported. Used in place of the rename-on-success pattern
+     * for the {@code plugins/FleaTags/} auto-detect path, since that directory is read-only
+     * from SwagTags's perspective — see {@link #importLegacyYamlIfPresent()}.
+     */
+    private File siblingImportMarker(String sourceName) {
+        return new File(plugin.getDataFolder(), "." + sourceName + ".imported-from-fleatags");
+    }
+
+    private boolean isSiblingAlreadyImported(String sourceName) {
+        return siblingImportMarker(sourceName).isFile();
+    }
+
+    /** Accepts either a {@code File} (yaml import) or a {@code File} (playerdata folder) — both just need a name recorded. */
+    private void markSiblingImported(String sourceName) {
+        File marker = siblingImportMarker(sourceName);
+        try {
+            File parent = marker.getParentFile();
+            if (parent != null && !parent.isDirectory() && !parent.mkdirs()) {
+                plugin.getLogger().warning("Could not create SwagTags data folder to write import marker for '" + sourceName + "'.");
+                return;
+            }
+            if (marker.createNewFile()) {
+                plugin.getLogger().info("Marked sibling FleaTags '" + sourceName + "' as imported (won't be re-imported on next restart).");
+            }
+        } catch (java.io.IOException e) {
+            plugin.getLogger().warning("Legacy import of sibling FleaTags '" + sourceName + "' succeeded but its marker file could not be " +
+                    "written (" + e.getMessage() + "). It may be re-imported on next restart — this is safe (insert-if-absent) but noisy.");
         }
     }
 }
